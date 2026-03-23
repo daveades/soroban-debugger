@@ -1,4 +1,5 @@
 use crate::analyzer::upgrade::{CompatibilityReport, ExecutionDiff, UpgradeAnalyzer};
+use crate::analyzer::{security::SecurityAnalyzer, symbolic::SymbolicAnalyzer};
 use crate::cli::args::{
     AnalyzeArgs, CompareArgs, InspectArgs, InteractiveArgs, OptimizeArgs, ProfileArgs, RemoteArgs,
     ReplArgs, ReplayArgs, RunArgs, ScenarioArgs, ServerArgs, SymbolicArgs, TuiArgs,
@@ -11,6 +12,7 @@ use crate::inspector::events::{ContractEvent, EventInspector};
 use crate::logging;
 use crate::output::OutputWriter;
 use crate::repeat::RepeatRunner;
+use crate::repl::ReplConfig;
 use crate::runtime::executor::ContractExecutor;
 use crate::simulator::SnapshotLoader;
 use crate::ui::formatter::Formatter;
@@ -48,6 +50,100 @@ fn print_verbose(message: impl AsRef<str>) {
     if Formatter::is_verbose() {
         println!("{}", Formatter::info(message));
     }
+}
+
+#[derive(serde::Serialize)]
+struct DynamicAnalysisMetadata {
+    function: String,
+    args: Option<String>,
+    result: Option<String>,
+    trace_entries: usize,
+}
+
+#[derive(serde::Serialize)]
+struct AnalyzeCommandOutput {
+    findings: Vec<crate::analyzer::security::SecurityFinding>,
+    dynamic_analysis: Option<DynamicAnalysisMetadata>,
+    warnings: Vec<String>,
+}
+
+fn render_symbolic_report(report: &crate::analyzer::symbolic::SymbolicReport) -> String {
+    let mut lines = vec![
+        format!("Function: {}", report.function),
+        format!("Paths explored: {}", report.paths_explored),
+        format!("Panics found: {}", report.panics_found),
+    ];
+
+    if report.paths.is_empty() {
+        lines.push("No distinct execution paths were discovered.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    lines.push("Distinct paths:".to_string());
+
+    for (idx, path) in report.paths.iter().enumerate() {
+        let outcome = match (&path.return_value, &path.panic) {
+            (Some(value), _) => format!("return {}", value),
+            (_, Some(panic)) => format!("panic {}", panic),
+            _ => "unknown".to_string(),
+        };
+        lines.push(format!(
+            "  {}. inputs={} -> {}",
+            idx + 1,
+            path.inputs,
+            outcome
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn render_security_report(output: &AnalyzeCommandOutput) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(dynamic) = &output.dynamic_analysis {
+        lines.push(format!("Dynamic analysis function: {}", dynamic.function));
+        if let Some(args) = &dynamic.args {
+            lines.push(format!("Dynamic analysis args: {}", args));
+        }
+        if let Some(result) = &dynamic.result {
+            lines.push(format!("Dynamic execution result: {}", result));
+        }
+        lines.push(format!(
+            "Dynamic trace entries captured: {}",
+            dynamic.trace_entries
+        ));
+        lines.push(String::new());
+    }
+
+    if !output.warnings.is_empty() {
+        lines.push("Warnings:".to_string());
+        for warning in &output.warnings {
+            lines.push(format!("  - {}", warning));
+        }
+        lines.push(String::new());
+    }
+
+    if output.findings.is_empty() {
+        lines.push("No security findings detected.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(format!("Findings: {}", output.findings.len()));
+    for (idx, finding) in output.findings.iter().enumerate() {
+        lines.push(format!(
+            "  {}. [{:?}] {} at {}",
+            idx + 1,
+            finding.severity,
+            finding.rule_id,
+            finding.location
+        ));
+        lines.push(format!("     {}", finding.description));
+        lines.push(format!("     Remediation: {}", finding.remediation));
+    }
+
+    lines.join("\n")
 }
 
 /// Placeholder for instruction stepping
@@ -1478,30 +1574,135 @@ pub fn inspect(args: InspectArgs, _verbosity: Verbosity) -> Result<()> {
 
 /// Run symbolic execution analysis
 pub fn symbolic(args: SymbolicArgs, _verbosity: Verbosity) -> Result<()> {
-    print_info("Symbolic mode is not yet implemented in this build");
-    print_info(format!("Contract: {:?}", args.contract));
-    Err(DebuggerError::ExecutionError("Symbolic mode not yet implemented".to_string()).into())
+    print_info(format!("Loading contract: {:?}", args.contract));
+    let wasm_file = crate::utils::wasm::load_wasm(&args.contract)
+        .with_context(|| format!("Failed to read WASM file: {:?}", args.contract))?;
+
+    let analyzer = SymbolicAnalyzer::new();
+    let report = analyzer.analyze(&wasm_file.bytes, &args.function)?;
+
+    println!("{}", render_symbolic_report(&report));
+
+    if let Some(output_path) = &args.output {
+        let scenario_toml = analyzer.generate_scenario_toml(&report);
+        fs::write(output_path, scenario_toml).map_err(|e| {
+            DebuggerError::FileError(format!(
+                "Failed to write symbolic scenario to {:?}: {}",
+                output_path, e
+            ))
+        })?;
+        print_success(format!("Scenario TOML written to: {:?}", output_path));
+    }
+
+    Ok(())
 }
 
 /// Analyze a contract
 pub fn analyze(args: AnalyzeArgs, _verbosity: Verbosity) -> Result<()> {
-    print_info("Analyze mode is not yet implemented in this build");
-    print_info(format!("Contract: {:?}", args.contract));
-    Err(DebuggerError::ExecutionError("Analyze mode not yet implemented".to_string()).into())
+    print_info(format!("Loading contract: {:?}", args.contract));
+    let wasm_file = crate::utils::wasm::load_wasm(&args.contract)
+        .with_context(|| format!("Failed to read WASM file: {:?}", args.contract))?;
+
+    let mut dynamic_analysis = None;
+    let mut warnings = Vec::new();
+    let mut executor = None;
+    let mut trace_entries = None;
+
+    if let Some(function) = &args.function {
+        let mut dynamic_executor = ContractExecutor::new(wasm_file.bytes.clone())?;
+        dynamic_executor.enable_mock_all_auths();
+
+        if let Some(storage_json) = &args.storage {
+            dynamic_executor.set_initial_storage(parse_storage(storage_json)?)?;
+        }
+
+        let parsed_args = if let Some(args_json) = &args.args {
+            Some(parse_args(args_json)?)
+        } else {
+            None
+        };
+
+        match dynamic_executor.execute(function, parsed_args.as_deref()) {
+            Ok(result) => {
+                let trace: Vec<String> = dynamic_executor
+                    .get_diagnostic_events()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|event| format!("{:?}", event))
+                    .collect();
+
+                dynamic_analysis = Some(DynamicAnalysisMetadata {
+                    function: function.clone(),
+                    args: parsed_args.clone(),
+                    result: Some(result),
+                    trace_entries: trace.len(),
+                });
+                trace_entries = Some(trace);
+                executor = Some(dynamic_executor);
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "Dynamic analysis for function '{}' failed: {}",
+                    function, err
+                ));
+            }
+        }
+    }
+
+    let analyzer = SecurityAnalyzer::new();
+    let report = analyzer.analyze(
+        &wasm_file.bytes,
+        executor.as_ref(),
+        trace_entries.as_deref(),
+    )?;
+    let output = AnalyzeCommandOutput {
+        findings: report.findings,
+        dynamic_analysis,
+        warnings,
+    };
+
+    match args.format.to_lowercase().as_str() {
+        "text" => println!("{}", render_security_report(&output)),
+        "json" => println!(
+            "{}",
+            serde_json::to_string_pretty(&output).map_err(|e| {
+                DebuggerError::FileError(format!("Failed to serialize analysis output: {}", e))
+            })?
+        ),
+        other => {
+            return Err(DebuggerError::InvalidArguments(format!(
+                "Unsupported --format '{}'. Use 'text' or 'json'.",
+                other
+            ))
+            .into())
+        }
+    }
+
+    Ok(())
 }
 
 /// Run a scenario
 pub fn scenario(args: ScenarioArgs, _verbosity: Verbosity) -> Result<()> {
-    print_info("Scenario mode is not yet implemented in this build");
-    print_info(format!("Scenario: {:?}", args.scenario));
-    Err(DebuggerError::ExecutionError("Scenario mode not yet implemented".to_string()).into())
+    crate::scenario::run_scenario(args, _verbosity)
 }
 
 /// Launch the REPL
 pub async fn repl(args: ReplArgs) -> Result<()> {
-    print_info("REPL mode is not yet implemented in this build");
-    print_info(format!("Contract: {:?}", args.contract));
-    Err(DebuggerError::ExecutionError("REPL mode not yet implemented".to_string()).into())
+    print_info(format!("Loading contract: {:?}", args.contract));
+    let wasm_file = crate::utils::wasm::load_wasm(&args.contract)
+        .with_context(|| format!("Failed to read WASM file: {:?}", args.contract))?;
+    crate::utils::wasm::verify_wasm_hash(&wasm_file.sha256_hash, args.expected_hash.as_ref())?;
+
+    if args.expected_hash.is_some() {
+        print_verbose("Checksum verified ✓");
+    }
+
+    crate::repl::start_repl(ReplConfig {
+        contract_path: args.contract,
+        network_snapshot: args.network_snapshot,
+        storage: args.storage,
+    })
+    .await
 }
 
 /// Show budget trend chart
