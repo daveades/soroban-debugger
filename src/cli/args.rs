@@ -162,6 +162,10 @@ pub enum Commands {
 
     /// Run a multi-step scenario from a TOML file
     Scenario(ScenarioArgs),
+
+    /// Plugin-provided subcommand (loaded at runtime)
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Parser)]

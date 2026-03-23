@@ -156,6 +156,9 @@ fn main() -> miette::Result<()> {
     Formatter::set_verbosity(verbosity_to_level(verbosity));
     initialize_tracing(verbosity);
 
+    // Load community plugins at startup unless disabled via env var.
+    let _ = soroban_debugger::plugin::registry::init_global_plugin_registry();
+
     let config = soroban_debugger::config::Config::load_or_default();
 
     let result = match cli.command {
@@ -195,6 +198,53 @@ fn main() -> miette::Result<()> {
             tokio::runtime::Runtime::new()
                 .map_err(|e: std::io::Error| miette::miette!(e))
                 .and_then(|rt| rt.block_on(soroban_debugger::cli::commands::repl(args)))
+        }
+        Some(Commands::External(argv)) => {
+            if argv.is_empty() {
+                return Err(miette::miette!("Missing plugin subcommand"));
+            }
+
+            let command = &argv[0];
+            let args = argv[1..].to_vec();
+
+            match soroban_debugger::plugin::registry::execute_global_command(command, &args) {
+                Ok(Some(output)) => {
+                    println!("{}", output);
+                    Ok(())
+                }
+                Ok(None) => {
+                    // If no plugin registered a command, try treating this as a formatter invocation.
+                    if let Ok(Some(formatted)) =
+                        soroban_debugger::plugin::registry::format_global_output(
+                            command,
+                            &args.join(" "),
+                        )
+                    {
+                        println!("{}", formatted);
+                        return Ok(());
+                    }
+
+                    let available = soroban_debugger::plugin::registry::global_commands();
+                    let formatters = soroban_debugger::plugin::registry::global_formatters();
+                    let mut message = format!("Unknown command: '{command}'");
+                    if !available.is_empty() {
+                        message.push_str("\n\nAvailable plugin commands:\n");
+                        for cmd in available {
+                            message.push_str(&format!("  - {}: {}\n", cmd.name, cmd.description));
+                        }
+                    }
+                    if !formatters.is_empty() {
+                        message.push_str("\nAvailable plugin formatters:\n");
+                        for fmt in formatters {
+                            message.push_str(&format!("  - {}\n", fmt.name));
+                        }
+                    }
+                    Err(soroban_debugger::DebuggerError::ExecutionError(message).into())
+                }
+                Err(e) => {
+                    Err(soroban_debugger::DebuggerError::ExecutionError(e.to_string()).into())
+                }
+            }
         }
         None => {
             if let Some(path) = cli.list_functions {

@@ -1,10 +1,90 @@
-use super::api::{PluginError, PluginResult};
+use super::api::{OutputFormatter, PluginCommand, PluginError, PluginResult};
 use super::events::{EventContext, ExecutionEvent};
 use super::loader::{LoadedPlugin, PluginLoader};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
+
+static GLOBAL_PLUGIN_REGISTRY: OnceLock<Arc<RwLock<PluginRegistry>>> = OnceLock::new();
+
+fn env_var_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// Initialize the global plugin registry and load plugins from disk.
+///
+/// This is intended to be called once at startup.
+pub fn init_global_plugin_registry() -> Arc<RwLock<PluginRegistry>> {
+    GLOBAL_PLUGIN_REGISTRY
+        .get_or_init(|| {
+            let mut registry = PluginRegistry::new().unwrap_or_default();
+            if env_var_truthy("SOROBAN_DEBUG_NO_PLUGINS") {
+                info!("Plugins disabled via SOROBAN_DEBUG_NO_PLUGINS");
+            } else {
+                let _ = registry.load_all_plugins();
+            }
+            Arc::new(RwLock::new(registry))
+        })
+        .clone()
+}
+
+pub fn dispatch_global_event(event: &ExecutionEvent, context: &mut EventContext) {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return;
+    };
+
+    if let Ok(registry) = registry.read() {
+        registry.dispatch_event(event, context);
+    }
+}
+
+pub fn execute_global_command(command: &str, args: &[String]) -> PluginResult<Option<String>> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Ok(None);
+    };
+
+    let registry = registry
+        .read()
+        .map_err(|_| PluginError::ExecutionFailed("Failed to acquire registry lock".to_string()))?;
+    registry.execute_command(command, args)
+}
+
+pub fn global_commands() -> Vec<PluginCommand> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Vec::new();
+    };
+
+    registry
+        .read()
+        .map(|r| r.all_commands())
+        .unwrap_or_default()
+}
+
+pub fn global_formatters() -> Vec<OutputFormatter> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Vec::new();
+    };
+
+    registry
+        .read()
+        .map(|r| r.all_formatters())
+        .unwrap_or_default()
+}
+
+pub fn format_global_output(formatter: &str, data: &str) -> PluginResult<Option<String>> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Ok(None);
+    };
+
+    let registry = registry
+        .read()
+        .map_err(|_| PluginError::ExecutionFailed("Failed to acquire registry lock".to_string()))?;
+    registry.format_output(formatter, data)
+}
 
 /// Registry that manages all loaded plugins
 pub struct PluginRegistry {
@@ -243,6 +323,89 @@ impl PluginRegistry {
 
         stats.total = self.plugins.len();
         stats
+    }
+
+    pub fn all_commands(&self) -> Vec<PluginCommand> {
+        let mut out = Vec::new();
+        for plugin_arc in self.plugins.values() {
+            if let Ok(plugin) = plugin_arc.read() {
+                let caps = &plugin.manifest().capabilities;
+                if !caps.provides_commands {
+                    continue;
+                }
+                out.extend(plugin.plugin().commands());
+            }
+        }
+        out
+    }
+
+    pub fn all_formatters(&self) -> Vec<OutputFormatter> {
+        let mut out = Vec::new();
+        for plugin_arc in self.plugins.values() {
+            if let Ok(plugin) = plugin_arc.read() {
+                let caps = &plugin.manifest().capabilities;
+                if !caps.provides_formatters {
+                    continue;
+                }
+                out.extend(plugin.plugin().formatters());
+            }
+        }
+        out
+    }
+
+    /// Execute a plugin-provided command, if any plugin declares it.
+    pub fn execute_command(&self, command: &str, args: &[String]) -> PluginResult<Option<String>> {
+        for (name, plugin_arc) in &self.plugins {
+            let mut plugin = plugin_arc.write().map_err(|_| {
+                PluginError::ExecutionFailed(format!("Failed to acquire plugin lock: {}", name))
+            })?;
+
+            if !plugin.manifest().capabilities.provides_commands {
+                continue;
+            }
+
+            if !plugin
+                .plugin()
+                .commands()
+                .iter()
+                .any(|cmd| cmd.name == command)
+            {
+                continue;
+            }
+
+            return plugin.plugin_mut().execute_command(command, args).map(Some);
+        }
+
+        Ok(None)
+    }
+
+    pub fn format_output(&self, formatter: &str, data: &str) -> PluginResult<Option<String>> {
+        for (name, plugin_arc) in &self.plugins {
+            let plugin = plugin_arc.read().map_err(|_| {
+                PluginError::ExecutionFailed(format!("Failed to acquire plugin lock: {}", name))
+            })?;
+
+            if !plugin.manifest().capabilities.provides_formatters {
+                continue;
+            }
+
+            if !plugin
+                .plugin()
+                .formatters()
+                .iter()
+                .any(|fmt| fmt.name == formatter)
+            {
+                continue;
+            }
+
+            drop(plugin);
+            let mut plugin = plugin_arc.write().map_err(|_| {
+                PluginError::ExecutionFailed(format!("Failed to acquire plugin lock: {}", name))
+            })?;
+            return plugin.plugin().format_output(formatter, data).map(Some);
+        }
+
+        Ok(None)
     }
 }
 

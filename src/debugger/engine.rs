@@ -2,6 +2,7 @@ use crate::debugger::breakpoint::BreakpointManager;
 use crate::debugger::instruction_pointer::StepMode;
 use crate::debugger::state::DebugState;
 use crate::debugger::stepper::Stepper;
+use crate::plugin::{EventContext, ExecutionEvent};
 use crate::runtime::executor::ContractExecutor;
 use crate::runtime::instruction::Instruction;
 use crate::runtime::instrumentation::Instrumenter;
@@ -104,6 +105,21 @@ impl DebuggerEngine {
             state.call_stack_mut().push(function.to_string(), None);
         }
 
+        let mut plugin_ctx = EventContext::new();
+        plugin_ctx.stack_depth = self
+            .state
+            .lock()
+            .map(|s| s.call_stack().get_stack().len())
+            .unwrap_or(0);
+        plugin_ctx.is_paused = self.paused;
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::BeforeFunctionCall {
+                function: function.to_string(),
+                args: args.map(str::to_string),
+            },
+            &mut plugin_ctx,
+        );
+
         if check_breakpoints && self.breakpoints.should_break(function) {
             self.pause_at_function(function);
         }
@@ -113,6 +129,19 @@ impl DebuggerEngine {
         let duration = start_time.elapsed();
 
         self.update_call_stack(duration)?;
+
+        let event_result = match &result {
+            Ok(output) => Ok(output.clone()),
+            Err(e) => Err(e.to_string()),
+        };
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::AfterFunctionCall {
+                function: function.to_string(),
+                result: event_result,
+                duration,
+            },
+            &mut plugin_ctx,
+        );
 
         if let Err(ref e) = result {
             tracing::error!("Execution failed: {}", e);
@@ -137,6 +166,23 @@ impl DebuggerEngine {
 
         crate::logging::log_breakpoint(function);
         self.paused = true;
+
+        let mut plugin_ctx = EventContext::new();
+        plugin_ctx.stack_depth = 1;
+        plugin_ctx.is_paused = true;
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::BreakpointHit {
+                function: function.to_string(),
+                condition: None,
+            },
+            &mut plugin_ctx,
+        );
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::ExecutionPaused {
+                reason: "breakpoint".to_string(),
+            },
+            &mut plugin_ctx,
+        );
     }
 
     /// Stage an execution so the debugger starts in a paused state without
@@ -283,6 +329,13 @@ impl DebuggerEngine {
         if let Ok(mut state) = self.state.lock() {
             self.stepper.continue_execution(&mut state);
         }
+
+        let mut plugin_ctx = EventContext::new();
+        plugin_ctx.is_paused = false;
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::ExecutionResumed,
+            &mut plugin_ctx,
+        );
         Ok(())
     }
 
@@ -294,6 +347,22 @@ impl DebuggerEngine {
             state.set_current_function(function.to_string(), None);
             state.call_stack().display();
         }
+
+        let mut plugin_ctx = EventContext::new();
+        plugin_ctx.is_paused = true;
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::BreakpointHit {
+                function: function.to_string(),
+                condition: None,
+            },
+            &mut plugin_ctx,
+        );
+        crate::plugin::registry::dispatch_global_event(
+            &ExecutionEvent::ExecutionPaused {
+                reason: "breakpoint".to_string(),
+            },
+            &mut plugin_ctx,
+        );
     }
 
     pub fn is_paused(&self) -> bool {

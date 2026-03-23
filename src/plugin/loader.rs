@@ -81,7 +81,12 @@ impl PluginLoader {
             .parent()
             .ok_or_else(|| PluginError::Invalid("Invalid manifest path".to_string()))?;
 
-        let library_path = manifest_dir.join(&manifest.library);
+        let mut library_path = manifest_dir.join(&manifest.library);
+        if !library_path.exists() {
+            if let Some(fallback) = resolve_platform_library_path(manifest_dir, &manifest.library) {
+                library_path = fallback;
+            }
+        }
 
         if !library_path.exists() {
             return Err(PluginError::NotFound(format!(
@@ -191,6 +196,39 @@ impl PluginLoader {
             .map(|manifest_path| self.load_from_manifest(manifest_path))
             .collect()
     }
+}
+
+fn resolve_platform_library_path(manifest_dir: &Path, library: &str) -> Option<PathBuf> {
+    let wanted_ext = match std::env::consts::OS {
+        "windows" => "dll",
+        "macos" => "dylib",
+        _ => "so",
+    };
+
+    let base = Path::new(library);
+    let stem = base.file_stem()?.to_string_lossy();
+    let file_name = base.file_name()?.to_string_lossy();
+
+    let mut candidates = Vec::new();
+
+    // 1) Same stem, correct extension.
+    candidates.push(format!("{stem}.{wanted_ext}"));
+
+    // 2) Try toggling the `lib` prefix for cross-platform portability.
+    if wanted_ext == "dll" && file_name.starts_with("lib") {
+        candidates.push(format!("{}.dll", stem.trim_start_matches("lib")));
+    } else if wanted_ext != "dll" && !file_name.starts_with("lib") {
+        candidates.push(format!("lib{stem}.{wanted_ext}"));
+    }
+
+    for candidate in candidates {
+        let p = manifest_dir.join(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    None
 }
 
 impl Drop for LoadedPlugin {
