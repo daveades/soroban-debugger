@@ -54,6 +54,7 @@ impl SecurityAnalyzer {
                 Box::new(ArithmeticCheckRule),
                 Box::new(AuthorizationCheckRule),
                 Box::new(ReentrancyPatternRule),
+                Box::new(CrossContractImportRule),
                 Box::new(UnboundedIterationRule),
             ],
         }
@@ -255,6 +256,109 @@ impl SecurityRule for ReentrancyPatternRule {
         }
         Ok(findings)
     }
+}
+
+struct CrossContractImportRule;
+impl SecurityRule for CrossContractImportRule {
+    fn name(&self) -> &str {
+        "cross-contract-import"
+    }
+
+    fn description(&self) -> &str {
+        "Detects cross-contract host function imports with robust name matching."
+    }
+
+    fn analyze_static(&self, wasm_bytes: &[u8]) -> Result<Vec<SecurityFinding>> {
+        let mut matches = Vec::new();
+
+        for payload in Parser::new(0).parse_all(wasm_bytes) {
+            let Ok(payload) = payload else {
+                // Many unit tests feed non-module bytes into the analyzer. Degrade gracefully.
+                return Ok(Vec::new());
+            };
+
+            if let Payload::ImportSection(reader) = payload {
+                for import in reader.into_iter() {
+                    let Ok(import) = import else {
+                        continue;
+                    };
+
+                    if !matches!(import.ty, wasmparser::TypeRef::Func(_)) {
+                        continue;
+                    }
+
+                    if is_cross_contract_host_import(import.module, import.name) {
+                        matches.push(format!("{}::{}", import.module, import.name));
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![SecurityFinding {
+            rule_id: self.name().to_string(),
+            severity: Severity::Low,
+            location: "Import Section".to_string(),
+            description: format!(
+                "Cross-contract host imports detected: {}",
+                matches.join(", ")
+            ),
+            remediation: "Review external call sites for reentrancy and authorization checks."
+                .to_string(),
+        }])
+    }
+}
+
+fn canonicalize_ascii(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+fn is_env_like_module(module: &str) -> bool {
+    let m = canonicalize_ascii(module);
+    m == "env" || m.starts_with("sorobanenv")
+}
+
+fn is_cross_contract_host_function_name(name: &str) -> bool {
+    const BASES: &[&str] = &[
+        "invokecontract",
+        "tryinvokecontract",
+        "callcontract",
+        "trycallcontract",
+        "trycall",
+    ];
+
+    let n = canonicalize_ascii(name);
+    for base in BASES {
+        if n == *base {
+            return true;
+        }
+        if n.starts_with(base) {
+            let suffix = &n[base.len()..];
+            if suffix.is_empty() {
+                return true;
+            }
+            if let Some(rest) = suffix.strip_prefix('v') {
+                if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn is_cross_contract_host_import(module: &str, name: &str) -> bool {
+    is_env_like_module(module) && is_cross_contract_host_function_name(name)
 }
 
 struct UnboundedIterationRule;
