@@ -35,7 +35,6 @@ exclude = [
     "ARCHITECTURE.md",
     "BATCH_EXECUTION_SUMMARY.md",
     "CONTRIBUTING.md",
-    "CONTRIBUTION.md",
     "test_snapshot.rs",
 ]
 
